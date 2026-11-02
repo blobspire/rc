@@ -1,0 +1,575 @@
+#!/usr/bin/env bash
+# rc: start Claude Code Remote Control sessions on your other computers.
+# https://github.com/blobspire/rc (MIT License)
+#
+# Each session is a tmux session on the other computer running `claude --remote-control <name>`,
+# so it survives SSH disconnects and you can drive it from claude.ai, the Claude app, or a terminal.
+set -uo pipefail
+
+VERSION=0.1.0
+
+# rc is normally a symlink on PATH; find the repo it lives in (network hooks use its examples).
+src=$0
+while [ -L "$src" ]; do
+  link_dir=$(cd -P "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case $src in /*) ;; *) src=$link_dir/$src ;; esac
+done
+RC_HOME=$(cd -P "$(dirname "$src")" && pwd)
+export RC_HOME
+CONF_DIR=${RC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/rc}
+# shellcheck disable=SC2088  # the ~ is expanded on the other computer, not here
+DEFAULT_DIR='~/rc'
+WAIT_SECS=${RC_WAIT:-45}
+
+usage() {
+  cat <<EOF
+rc: start Claude Code Remote Control sessions on your other computers.
+
+  rc <computer> <name>              start session <name> there (or reattach) and attach to it
+  rc <computer> -d <name>           start it in the background and print its control URL
+  rc <computer> [name] -p "<task>"  start it in the background with a first prompt
+                                    (no name: one is made from the task; -p - reads stdin)
+  rc <computer>                     list sessions there, with their control URLs
+  rc <computer> -s <name>           show the end of a session's screen (what Claude last said)
+  rc <computer> -k <name>           stop session <name>
+  rc ls                             list sessions on every computer you've used
+  rc doctor <computer>              check a computer end to end and explain any fixes
+
+Options:
+  -C, --dir <folder>  folder to start in, on that computer (default: its DIR setting, else ~/rc)
+  -a, --attach        attach after starting, even with -p
+  -h, --help          show this help
+  -V, --version       show the version and where rc is installed
+
+<computer> is anything 'ssh <computer>' reaches. Optional settings per computer live in
+$CONF_DIR/computers/<computer>. Sessions start in auto mode; see the README to change that.
+EOF
+}
+
+die()   { printf 'rc: %s\n' "$*" >&2; exit 1; }
+say()   { printf '%s\n' "$*" >&2; }
+ok()    { printf '  ok    %s\n' "$*"; }
+warnl() { printf '  warn  %s\n' "$*"; }
+bad()   { printf '  FAIL  %s\n' "$*"; }
+slug()  { printf '%s' "$*" | tr -cs 'A-Za-z0-9_-' '-' | sed 's/^-*//; s/-*$//'; }
+# Quote one argument for a POSIX shell (the remote login shell parses our command line).
+sq()    { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# First five words of a prompt, as a session name: "Fix the flaky login tests" -> fix-the-flaky-login-tests
+name_from_prompt() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' ' ' |
+    awk '{ for (i = 1; i <= NF && i <= 5; i++) printf "%s%s", (i > 1 ? "-" : ""), $i; exit }' | cut -c1-40
+}
+
+load_computer() {
+  C=$1
+  case $C in
+    ""|-*|*[!A-Za-z0-9._@:-]*) die "'$C' doesn't look like a computer name (anything 'ssh <name>' reaches)" ;;
+  esac
+  SSH_HOST=$C DIR="" NET="" CLAUDE_ARGS="--permission-mode auto"
+  CFILE=$CONF_DIR/computers/$C
+  # shellcheck source=/dev/null
+  if [ -f "$CONF_DIR/config" ]; then . "$CONF_DIR/config"; fi
+  # shellcheck source=/dev/null
+  if [ -f "$CFILE" ]; then . "$CFILE"; fi
+  if [ -n "${RC_DIR:-}" ]; then DIR=$RC_DIR; fi
+  if [ -n "${RC_ARGS:-}" ]; then
+    case " $RC_ARGS" in
+      *" --permission-mode"*|*" --dangerously-skip-permissions"*)
+        CLAUDE_ARGS=$(printf '%s' "$CLAUDE_ARGS" | sed 's/--permission-mode[ =][^ ]*//') ;;
+    esac
+    CLAUDE_ARGS="$CLAUDE_ARGS $RC_ARGS"
+  fi
+  export RC_COMPUTER=$C RC_SSH_HOST=$SSH_HOST
+}
+
+# Remember a computer once it has worked, so `rc ls` knows about it, and leave a settings template.
+remember() {
+  [ -f "$CFILE" ] && return 0
+  mkdir -p "$CONF_DIR/computers" 2>/dev/null || return 0
+  cat > "$CFILE" 2>/dev/null <<EOF
+# rc settings for $C. All optional: uncomment a line to change the default.
+# SSH_HOST='$C'              # what to pass to ssh, if different from the name you type
+# DIR='~/code'              # folder sessions start in on $C (keep the quotes so ~ is $C's home)
+# NET="\$RC_HOME/examples/network/tailscale-up.sh"   # runs only when $C can't be reached
+# CLAUDE_ARGS='--permission-mode auto'               # flags for claude
+EOF
+}
+
+reach() { ssh -o BatchMode=yes -o ConnectTimeout="${1:-6}" "$SSH_HOST" true </dev/null >/dev/null 2>&1; }
+
+# Make sure SSH works, running the computer's network hook only if it doesn't.
+net_up() {
+  reach 6 && return 0
+  [ -n "$NET" ] || die "can't reach $C over SSH. Check that 'ssh -o BatchMode=yes $SSH_HOST true' works (key-based login, no password prompt). If $C is only reachable over a VPN or tunnel, set NET in $CFILE (see the README)."
+  say "$C isn't reachable; running its network hook"
+  local log
+  log=$(mktemp "${TMPDIR:-/tmp}/rc-net.XXXXXX") || die "mktemp failed"
+  if ! sh -c "$NET" >"$log" 2>&1; then
+    sed 's/^/  /' "$log" >&2; rm -f "$log"
+    die "the network hook failed: $NET"
+  fi
+  sed 's/^/  /' "$log" >&2; rm -f "$log"
+  local _
+  for _ in 1 2 3 4 5; do reach 10 && return 0; sleep 2; done
+  die "the network hook finished but $C still isn't reachable over SSH"
+}
+
+# Run one operation on the other computer. The script below goes over stdin; its arguments are
+# quoted for the remote login shell (bash, zsh, or fish), and they never contain newlines.
+remote() {
+  local cmd="bash -s --" a
+  for a in "$@"; do cmd="$cmd $(sq "$a")"; done
+  remote_lib | ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_HOST" "$cmd"
+}
+
+remote_lib() {
+  cat <<'REMOTE'
+# Everything is inside main() so bash reads the whole script before running any of it:
+# nothing a command reads from stdin can eat the rest of the script.
+main() {
+set -u
+PATH="$PATH:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/snap/bin"; export PATH
+S="$HOME/.rc-sessions"
+URL_RE='https://claude\.ai/code/session_[A-Za-z0-9_]+'
+op=$1; shift
+
+has_tmux() { command -v tmux >/dev/null 2>&1; }
+alive()    { tmux has-session -t "=$1" 2>/dev/null; }
+pane()     { tmux capture-pane -p -J -S -3000 -t "=$1:" 2>/dev/null; }
+url_of()   { pane "$1" | grep -oE "$URL_RE" | tail -n 1; }
+expand() {
+  case $1 in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${1#"~/"}" ;;
+    '$HOME') printf '%s' "$HOME" ;;
+    '$HOME/'*) printf '%s/%s' "$HOME" "${1#'$HOME/'}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+find_claude() {
+  local c p sh t=""
+  c=$(command -v claude 2>/dev/null) && [ -n "$c" ] && { printf '%s' "$c"; return 0; }
+  for p in "$HOME/.local/bin/claude" "$HOME/.claude/local/claude" /opt/homebrew/bin/claude /usr/local/bin/claude /usr/bin/claude; do
+    [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  # Last resort: an npm/nvm install that only the user's interactive shell knows about.
+  command -v timeout >/dev/null 2>&1 && t="timeout 8"
+  for sh in "${SHELL:-}" bash; do
+    [ -n "$sh" ] || continue
+    c=$($t "$sh" -lic 'command -v claude' </dev/null 2>/dev/null | tail -n 1)
+    case $c in /*) [ -x "$c" ] && { printf '%s' "$c"; return 0; } ;; esac
+  done
+  return 1
+}
+
+case $op in
+ls)
+  has_tmux || { echo "(tmux isn't installed)"; return 0; }
+  names=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+  [ -n "$names" ] || { echo "(no sessions)"; return 0; }
+  printf '%s\n' "$names" | while IFS= read -r n; do
+    u=$(url_of "$n")
+    printf '%-28s %s\n' "$n" "${u:-(no control URL on screen)}"
+  done
+  ;;
+show)
+  has_tmux && alive "$1" || return 3
+  tmux capture-pane -p -J -S -300 -t "=$1:" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n "$2"
+  ;;
+rmdir)
+  rmdir "$(expand "$1")" 2>/dev/null
+  return 0
+  ;;
+kill)
+  if has_tmux && alive "$1"; then
+    tmux kill-session -t "=$1" && rm -f "$S/$1.sh" "$S/$1.prompt" "$S/$1.exited" && echo stopped
+  else
+    echo missing
+  fi
+  ;;
+start)
+  name=$1 dir=$2 mk=$3 args=$4 pb64=$5 auto=$6 wait=$7
+  has_tmux || { echo "error tmux"; return 0; }
+  if alive "$name"; then
+    if [ "$auto" = 1 ]; then
+      n=2; while alive "$name-$n"; do n=$((n + 1)); done; name=$name-$n
+    else
+      echo "exists $name"; u=$(url_of "$name"); [ -n "$u" ] && echo "url $u"; return 0
+    fi
+  fi
+  claude=$(find_claude) || { echo "error claude"; return 0; }
+  d=$(expand "$dir")
+  if [ ! -d "$d" ]; then
+    if [ "$mk" = 1 ]; then mkdir -p "$d" || { echo "error couldn't create $d"; return 0; }; echo "made $d"
+    else echo "error nodir $d"; return 0; fi
+  fi
+  mkdir -p "$S" || { echo "error couldn't create $S"; return 0; }
+  p="$S/$name.prompt"; rm -f "$p"
+  if [ -n "$pb64" ]; then
+    { printf '%s' "$pb64" | base64 -d > "$p" 2>/dev/null; } ||
+      { printf '%s' "$pb64" | base64 -D > "$p"; } || { echo "error couldn't decode the prompt"; return 0; }
+  fi
+  {
+    echo '#!/bin/bash -l'
+    echo "# Started by rc on $(date). Running this file again starts the same session."
+    printf 'cd %q || exit 1\n' "$d"
+    if [ -n "$pb64" ]; then
+      printf '%q --remote-control %q %s -- "$(cat %q)"\n' "$claude" "$name" "$args" "$p"
+    else
+      printf '%q --remote-control %q %s\n' "$claude" "$name" "$args"
+    fi
+    echo 'code=$?'
+    printf 'echo "$code" > %q\n' "$S/$name.exited"
+    # Keep claude's last screen readable (a new shell may clear it) until someone presses a key.
+    echo 'echo; echo "[claude exited with code $code. Press Enter for a shell here, or Ctrl-D to close this session.]"'
+    echo 'read -r _ || exit 0'
+    echo 'exec "${SHELL:-/bin/bash}" -l'
+  } > "$S/$name.sh" && chmod +x "$S/$name.sh" || { echo "error couldn't write $S/$name.sh"; return 0; }
+  rm -f "$S/$name.exited"
+  tmux new-session -d -s "$name" -x 200 -y 50 -c "$d" "$S/$name.sh" || { echo "error tmux couldn't start the session"; return 0; }
+  echo "created $name"
+  echo "cwd $d"
+  [ "$wait" -gt 0 ] || return 0
+  i=0; out=""
+  while [ "$i" -lt "$wait" ]; do
+    alive "$name" || { echo "warn died"; break; }
+    out=$(pane "$name")
+    u=$(printf '%s\n' "$out" | grep -oE "$URL_RE" | tail -n 1)
+    if [ -n "$u" ]; then echo "url $u"; return 0; fi
+    if [ -f "$S/$name.exited" ]; then echo "warn exited"; out=$(pane "$name"); break; fi
+    case $out in
+      *"trust this folder"*|*"Quick safety check"*) echo "warn trust"; return 0 ;;
+      *"Let's get started"*|*"Choose the text style"*|*"Select login method"*) echo "warn setup"; return 0 ;;
+      *"Remote Control requires"*|*"Remote Control is disabled"*|*"Remote Control isn't enabled"*|\
+      *"Remote Control was turned off"*|*"Remote Control is only available"*) echo "warn rc"; break ;;
+      *"[claude exited with code"*) echo "warn exited"; break ;;
+    esac
+    sleep 1; i=$((i + 1))
+  done
+  [ "$i" -ge "$wait" ] && echo "warn nourl"
+  printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 15 | sed 's/^/pane /'
+  ;;
+doctor)
+  dir=$1 mk=$2
+  echo "ok $(hostname) ($(uname -s) $(uname -r))"
+  if has_tmux; then echo "ok $(tmux -V)"
+  else echo "fail tmux isn't installed. Debian/Ubuntu: sudo apt install tmux; Fedora: sudo dnf install tmux; macOS: brew install tmux"; fi
+  t=""; command -v timeout >/dev/null 2>&1 && t="timeout 20"
+  if claude=$(find_claude); then
+    v=$($t "$claude" --version </dev/null 2>/dev/null | head -n 1 | awk '{print $1}')
+    echo "ok Claude Code ${v:-?} at $claude"
+    if [ -n "$v" ] && [ "$(printf '2.1.51\n%s\n' "$v" | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)" != 2.1.51 ]; then
+      echo "fail Claude Code $v is too old for Remote Control (needs 2.1.51 or later). Update it: claude update"
+    fi
+  else
+    echo "fail Claude Code isn't installed (or rc can't find it). Install it: curl -fsSL https://claude.ai/install.sh | bash"
+  fi
+  d=$(expand "$dir")
+  if [ "$d" = "$HOME" ] || [ "$d" = "$HOME/" ]; then
+    echo "fail the start folder is the home folder. Claude Code never remembers trusting it, so every session would stop at the trust question. Use a subfolder."
+  elif [ -d "$d" ]; then echo "ok start folder $d exists"
+  elif [ "$mk" = 1 ]; then echo "ok start folder $d will be created on first use"
+  else echo "fail start folder $d doesn't exist. Create it, or change DIR in this computer's rc settings."; fi
+  envs=$(bash -lc env </dev/null 2>/dev/null)
+  for v in CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC DISABLE_GROWTHBOOK ANTHROPIC_BASE_URL ANTHROPIC_API_KEY \
+           CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY; do
+    if printf '%s\n' "$envs" | grep -q "^$v=" || grep -qs "\"$v\"" "$HOME/.claude/settings.json"; then
+      case $v in
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC|DISABLE_GROWTHBOOK) why="turns Remote Control off" ;;
+        ANTHROPIC_BASE_URL) why="Remote Control only works when Claude Code talks to api.anthropic.com" ;;
+        ANTHROPIC_API_KEY) why="if Claude Code uses this key instead of your claude.ai login, Remote Control won't work" ;;
+        *) why="Remote Control isn't available through Bedrock, Vertex, or Foundry" ;;
+      esac
+      echo "warn $v is set (shell profile or ~/.claude/settings.json): $why"
+    fi
+  done
+  if [ "$(uname -s)" = Darwin ]; then
+    s=$(pmset -g 2>/dev/null | awk '$1 == "sleep" { print $2; exit }')
+    if [ -n "$s" ] && [ "$s" != 0 ]; then
+      echo "warn this Mac sleeps after $s minutes idle, and its sessions go offline while it sleeps. To keep it awake on power: sudo pmset -c sleep 0"
+    fi
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$d" <<'PY' 2>/dev/null
+import json, os, sys
+try:
+    projects = json.load(open(os.path.expanduser("~/.claude.json"))).get("projects", {})
+except Exception:
+    sys.exit(0)
+trusted = sorted(k for k, v in projects.items() if isinstance(v, dict) and v.get("hasTrustDialogAccepted"))
+for k in trusted[:8]:
+    print("trusted " + k)
+PY
+  fi
+  ;;
+*)
+  echo "error unknown operation $op"
+  ;;
+esac
+}
+main "$@"
+REMOTE
+}
+
+list_sessions() {
+  local out
+  out=$(remote ls) || die "lost the SSH connection to $C"
+  echo "$C:"
+  printf '%s\n' "$out" | sed 's/^/  /'
+}
+
+show_session() {
+  local out code
+  out=$(remote show "$1" 40); code=$?
+  [ $code = 3 ] && die "no session named '$1' on $C (names must match exactly; list them with: rc $C)"
+  [ $code = 0 ] || die "lost the SSH connection to $C"
+  echo "$C / $1 (end of its screen):"
+  printf '%s\n' "$out" | sed 's/^/  /'
+}
+
+kill_session() {
+  local out
+  out=$(remote kill "$1") || die "lost the SSH connection to $C"
+  [ "$out" = stopped ] || die "no session named '$1' on $C (names must match exactly; list them with: rc $C)"
+  echo "Stopped '$1' on $C."
+}
+
+start_failed() {
+  case $1 in
+    tmux) die "tmux isn't installed on $C. Install it there (Debian/Ubuntu: sudo apt install tmux; Fedora: sudo dnf install tmux; macOS: brew install tmux), then try again." ;;
+    claude) die "Claude Code isn't installed on $C, or rc can't find it. Install it there: curl -fsSL https://claude.ai/install.sh | bash" ;;
+    nodir\ *) die "the folder ${1#nodir } doesn't exist on $C. Create it, or change DIR in $CFILE (quote a leading ~ so it means $C's home: DIR='~/code')." ;;
+    *) die "couldn't start the session on $C: $1" ;;
+  esac
+}
+
+start_session() {
+  local name=$1 mk=$2 auto=$3 attach=$4 have_prompt=$5 prompt=$6
+  local pb64="" wait=$WAIT_SECS out line kind rest status=0 actual=$1 cwd="" url="" existed=0 warning="" screen=""
+  [ "$have_prompt" = 1 ] && pb64=$(printf '%s' "$prompt" | base64 | tr -d '\n')
+  [ "$attach" = 1 ] && wait=0
+  out=$(remote start "$name" "$DIR" "$mk" "$CLAUDE_ARGS" "$pb64" "$auto" "$wait") ||
+    die "lost the SSH connection to $C while starting '$name'"
+  while IFS= read -r line; do
+    kind=${line%% *}; rest=${line#* }
+    case $kind in
+      created) actual=$rest ;;
+      exists) existed=1; actual=$rest ;;
+      cwd) cwd=$rest ;;
+      url) url=$rest ;;
+      warn) warning=$rest; status=2 ;;
+      pane) screen="$screen    $rest
+" ;;
+      error) start_failed "$rest" ;;
+    esac
+  done <<EOF
+$out
+EOF
+  if [ $existed = 1 ]; then
+    echo "'$actual' is already running on $C."
+    if [ "$have_prompt" = 1 ]; then
+      echo "Your prompt was NOT sent to it. Attach and type it (rc $C $actual), or use a new name."
+      status=1
+    fi
+  else
+    echo "Started '$actual' on $C in $cwd"
+  fi
+  [ -z "$url" ] || echo "Control URL: $url"
+  case $warning in
+    trust) echo "It's waiting for you to trust $cwd (Claude Code asks once per folder). Attach to answer: rc $C $actual" ;;
+    setup) echo "Claude Code on $C needs first-time setup (theme and login). Attach to finish it: rc $C $actual" ;;
+    rc) echo "Remote Control isn't available for the Claude login on $C. Its screen:" ;;
+    exited) echo "claude exited right after starting. Its screen:" ;;
+    died) echo "The session closed right after starting. Its last screen:" ;;
+    nourl) echo "No control URL after ${WAIT_SECS}s. Its screen (attach to look: rc $C $actual):" ;;
+  esac
+  [ -z "$screen" ] || printf '%s' "$screen"
+  if [ "$attach" = 1 ]; then
+    exec ssh -t "$SSH_HOST" "bash -c 'PATH=\$PATH:/opt/homebrew/bin:/usr/local/bin; exec tmux attach -t =$actual'"
+  fi
+  [ $status = 0 ] && echo "Attach: rc $C $actual"
+  return $status
+}
+
+ls_all() {
+  local f c tmp found=0
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/rc-ls.XXXXXX") || die "mktemp failed"
+  for f in "$CONF_DIR"/computers/*; do
+    [ -f "$f" ] || continue
+    c=${f##*/}; found=1
+    (
+      load_computer "$c"
+      if reach 5; then
+        remote ls > "$tmp/$c" 2>&1 || echo "(SSH failed)" > "$tmp/$c"
+      else
+        echo "(not reachable right now; 'rc $c' runs its network hook if it has one)" > "$tmp/$c"
+      fi
+    ) &
+  done
+  wait
+  if [ $found = 0 ]; then
+    echo "No computers yet. Run 'rc <computer>' once and it's remembered."
+  else
+    for f in "$CONF_DIR"/computers/*; do
+      [ -f "$f" ] || continue
+      c=${f##*/}
+      echo "$c:"
+      if [ -f "$tmp/$c" ]; then sed 's/^/  /' "$tmp/$c"; else echo "  (couldn't read its settings)"; fi
+    done
+  fi
+  rm -rf "$tmp"
+}
+
+doctor() {
+  load_computer "$1"
+  local dir=${DIR:-$DEFAULT_DIR} mk=0 fails=0 out line kind rest trusted="" probe url warning err screen
+  [ -n "$DIR" ] || mk=1
+  echo "rc doctor: $C"
+  if [ -f "$CFILE" ]; then echo "  settings: $CFILE"; else echo "  settings: none yet (all defaults)"; fi
+  echo "  ssh host: $SSH_HOST"
+  echo "  folder:   $dir"
+  echo "  network:  ${NET:-none}"
+  echo "  claude:   $CLAUDE_ARGS"
+  echo
+  if reach 6; then
+    ok "SSH to $SSH_HOST works"
+  elif [ -n "$NET" ]; then
+    if (net_up); then ok "SSH works after running the network hook"
+    else bad "SSH to $SSH_HOST fails even after the network hook (see above)"; return 1; fi
+  else
+    bad "can't SSH to $SSH_HOST without a password prompt. Check: ssh -o BatchMode=yes $SSH_HOST true"
+    echo "        rc needs key-based login (ssh-copy-id $SSH_HOST). If $C is only reachable over a VPN, set NET in $CFILE."
+    return 1
+  fi
+  remember
+  out=$(remote doctor "$dir" "$mk") || { bad "SSH dropped while checking $C"; return 1; }
+  while IFS= read -r line; do
+    kind=${line%% *}; rest=${line#* }
+    case $kind in
+      ok) ok "$rest" ;;
+      warn) warnl "$rest" ;;
+      fail) bad "$rest"; fails=$((fails + 1)) ;;
+      trusted) trusted="$trusted        $rest
+" ;;
+    esac
+  done <<EOF
+$out
+EOF
+  if [ $fails -gt 0 ]; then echo; echo "Fix the problems above, then run: rc doctor $C"; return 1; fi
+  echo "  ...   starting a test session (it shows up briefly in your claude.ai session list)"
+  probe=rc-doctor-$$
+  out=$(remote start "$probe" "$dir" "$mk" "$CLAUDE_ARGS" "" 0 "$WAIT_SECS")
+  remote kill "$probe" >/dev/null 2>&1
+  # Don't leave behind a start folder that only this failed test created.
+  if ! printf '%s\n' "$out" | grep -q '^url ' && printf '%s\n' "$out" | grep -q '^made '; then
+    remote rmdir "$dir" >/dev/null 2>&1
+  fi
+  url=$(printf '%s\n' "$out" | sed -n 's/^url //p')
+  warning=$(printf '%s\n' "$out" | sed -n 's/^warn //p')
+  err=$(printf '%s\n' "$out" | sed -n 's/^error //p')
+  screen=$(printf '%s\n' "$out" | sed -n 's/^pane /        /p')
+  echo
+  if [ -n "$url" ]; then
+    ok "Remote Control works: a test session connected, then rc stopped it"
+    echo; echo "All good. Try: rc $C <name>"
+    return 0
+  fi
+  case $warning in
+    trust)
+      bad "Claude Code is asking whether to trust $dir on $C (it asks once per folder)."
+      echo "        Fix: run 'rc $C setup' in a terminal, choose 'Yes, I trust this folder', then"
+      echo "        detach with Ctrl-b d (the session keeps running) or keep working in it."
+      if [ -n "$trusted" ]; then
+        echo "        Or set DIR in $CFILE to a folder that's already trusted there:"
+        printf '%s' "$trusted"
+      fi ;;
+    setup)
+      bad "Claude Code on $C hasn't been set up yet."
+      echo "        Fix: run 'ssh -t $SSH_HOST claude' in a terminal, pick a theme, and log in"
+      echo "        with your Claude account (Pro, Max, Team, or Enterprise). Then type /exit." ;;
+    rc)
+      bad "Remote Control isn't available for the Claude login on $C. Its screen:"
+      printf '%s\n' "$screen"
+      echo "        See https://code.claude.com/docs/en/remote-control#troubleshooting" ;;
+    *)
+      case $err in
+        tmux|claude) bad "a required program is missing on $C ($err)" ;;
+        nodir\ *) bad "the folder ${err#nodir } doesn't exist on $C. Create it, or change DIR in $CFILE." ;;
+        ?*) bad "couldn't start a session: $err" ;;
+        *) bad "no control URL appeared (${warning:-timed out}). The session's screen:"
+           printf '%s\n' "$screen" ;;
+      esac ;;
+  esac
+  echo; echo "Fix the problem above, then run: rc doctor $C"
+  return 1
+}
+
+main() {
+  [ $# -gt 0 ] || { usage; return 0; }
+  case $1 in
+    -h|--help|help) usage; return 0 ;;
+    -V|--version|version) echo "rc $VERSION ($RC_HOME)"; return 0 ;;
+    ls) ls_all; return ;;
+    doctor) [ $# -ge 2 ] || die "usage: rc doctor <computer>"; doctor "$2"; return ;;
+  esac
+  local computer=$1; shift
+  local mode="" attach_flag=0 have_prompt=0 prompt="" dir_opt="" words="" name trimmed auto=0 mk=0 attach=1
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -d|--detach) mode="detach" ;;
+      -k|--kill) mode="kill" ;;
+      -s|--show) mode="show" ;;
+      -a|--attach) attach_flag=1 ;;
+      -p|--prompt) [ $# -ge 2 ] || die "-p needs a prompt (or - to read it from stdin)"; have_prompt=1; prompt=$2; shift ;;
+      -C|--dir) [ $# -ge 2 ] || die "$1 needs a folder"; dir_opt=$2; shift ;;
+      -h|--help) usage; return 0 ;;
+      --) shift; words="$words $*"; break ;;
+      -*) die "unknown option: $1 (see rc --help)" ;;
+      *) words="$words $1" ;;
+    esac
+    shift
+  done
+  if [ $have_prompt = 1 ] && [ "$prompt" = - ]; then prompt=$(cat); fi
+  if [ $have_prompt = 1 ] && [ -z "$prompt" ]; then die "the prompt is empty"; fi
+
+  load_computer "$computer"
+  [ -z "$dir_opt" ] || DIR=$dir_opt
+  if [ -z "$DIR" ]; then DIR=$DEFAULT_DIR; mk=1; fi
+
+  trimmed=${words# }
+  name=$(slug "$trimmed")
+  [ -z "$trimmed" ] || [ -n "$name" ] || die "session name '$trimmed' has no letters or numbers"
+  [ "$name" = "$trimmed" ] || say "note: using session name '$name'"
+
+  if [ "$mode" = kill ]; then
+    [ $have_prompt = 0 ] || die "-k and -p don't go together"
+    [ -n "$name" ] || die "which session? rc $C -k <name>"
+    net_up; kill_session "$name"; return
+  fi
+  if [ "$mode" = show ]; then
+    [ -n "$name" ] || die "which session? rc $C -s <name>"
+    net_up; show_session "$name"; return
+  fi
+  if [ -z "$name" ]; then
+    if [ $have_prompt = 1 ]; then
+      name=$(name_from_prompt "$prompt"); [ -n "$name" ] || name=task; auto=1
+    elif [ "$mode" = detach ]; then
+      die "which session? rc $C -d <name>"
+    else
+      net_up; remember; list_sessions; return
+    fi
+  fi
+  if [ "$mode" = detach ] || [ $have_prompt = 1 ]; then attach=0; fi
+  [ $attach_flag = 0 ] || attach=1
+  if [ $attach = 1 ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+    say "Not attaching: there's no terminal here. Starting '$name' in the background instead."
+    attach=0
+  fi
+  net_up
+  remember
+  start_session "$name" "$mk" "$auto" "$attach" "$have_prompt" "$prompt"
+}
+
+main "$@"

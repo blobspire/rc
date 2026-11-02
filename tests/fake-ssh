@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Test double for ssh: runs the "remote" command on this machine, in a sandbox with its own
+# HOME and its own tmux server. A host is "down" while $RC_TEST_DOWN/<host> exists.
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o|-p|-i|-l|-F) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+host=$1; shift
+if [ -e "$RC_TEST_DOWN/$host" ]; then
+  echo "ssh: connect to host $host port 22: Operation timed out" >&2
+  exit 255
+fi
+echo "$host" >> "$RC_TEST_LOG"
+export HOME=$RC_TEST_REMOTE_HOME TMUX_TMPDIR=$RC_TEST_TMUX
+PATH="$HOME/.local/bin:$(dirname "$(command -v tmux)"):/usr/bin:/bin"
+export PATH
+unset TMUX
+exec bash -c "$*"

@@ -1,0 +1,30 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tmux and shellcheck (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux shellcheck
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck rc install.sh examples/network/*.sh tests/run.sh tests/fake-ssh tests/fake-claude
+      - name: Tests (Linux bash)
+        if: runner.os == 'Linux'
+        run: tests/run.sh
+      - name: Tests (macOS /bin/bash 3.2)
+        if: runner.os == 'macOS'
+        run: RC_TEST_BASH=/bin/bash /bin/bash tests/run.sh

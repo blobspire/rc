@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Test double for `claude --remote-control <name> ...`: records its arguments and working
+# folder, then prints what the real one prints. Session names choose the behavior.
+[ "${1:-}" = --version ] && { echo "2.1.316 (Claude Code)"; exit 0; }
+name=""
+[ "${1:-}" = --remote-control ] && name=${2:-}
+for a in "$@"; do printf '%s\0' "$a"; done > "$HOME/args-$name"
+pwd > "$HOME/cwd-$name"
+if [ -f "$HOME/untrusted-dirs" ] && grep -qxF "$PWD" "$HOME/untrusted-dirs"; then
+  echo " Quick safety check: Is this a project you created or one you trust?"
+  sleep 600
+fi
+case $name in
+  *trust*)
+    echo " Quick safety check: Is this a project you created or one you trust?"
+    echo " ❯ No, exit"
+    echo "   Yes, I trust this folder"
+    sleep 600 ;;
+  *fresh*)
+    echo " Let's get started."
+    echo " Choose the text style that looks best with your terminal"
+    sleep 600 ;;
+  *crash*)
+    echo "something went wrong"
+    exit 3 ;;
+  *silent*)
+    sleep 600 ;;
+esac
+echo "  /remote-control is active · Continue here, on your phone, or at"
+echo "  https://claude.ai/code/session_TEST_${name//-/_}"
+sleep 600
