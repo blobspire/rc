@@ -7,7 +7,9 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 command -v tmux >/dev/null || { echo "tmux is required to run the tests"; exit 1; }
 RUN_BASH=${RC_TEST_BASH:-bash}
 
-T=$(mktemp -d "${TMPDIR:-/tmp}/rc-test.XXXXXX")
+# The real path: on macOS, TMPDIR ends in / and sits behind the /var -> /private/var symlink,
+# so the folders the fake claude records wouldn't match the paths these tests compare against.
+T=$(cd -P "$(mktemp -d "${TMPDIR:-/tmp}/rc-test.XXXXXX")" && pwd)
 export RC_TEST_REMOTE_HOME=$T/remote RC_TEST_TMUX=$T/tmux RC_TEST_DOWN=$T/down RC_TEST_LOG=$T/ssh.log
 mkdir -p "$RC_TEST_REMOTE_HOME/.local/bin" "$RC_TEST_TMUX" "$RC_TEST_DOWN" "$T/bin" "$T/home"
 cp "$ROOT/tests/fake-ssh" "$T/bin/ssh"
