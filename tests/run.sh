@@ -109,6 +109,29 @@ check "a missing folder is an error" has "doesn't exist on box"
 printf "DIR='~/my project'\n" > "$T/config/computers/box2"
 run box2 -d fromconfig; check "DIR from settings" test "$(cat "$R/cwd-fromconfig")" = "$R/my project"
 
+# --- projects: a first word that's a folder inside the start folder ------------------------
+mkdir -p "$R/rc/api" "$R/rc/.hidden" "$R/my project/web"
+run box -d api fix things
+check "a project word starts in that folder" test "$(cat "$R/cwd-fix-things")" = "$R/rc/api"
+check "...and the other words are the name" has "Started 'fix-things'"
+run box -k fix things;  check "stop takes the name without the project" has "Stopped 'fix-things'"
+run box -d api;         check "a project alone is the name" has "Started 'api'"
+                        check "...and starts in the project" test "$(cat "$R/cwd-api")" = "$R/rc/api"
+run box api -p "Tidy the readme"
+check "project with a prompt: named from the prompt" has "Started 'tidy-the-readme'"
+check "...in the project" test "$(cat "$R/cwd-tidy-the-readme")" = "$R/rc/api"
+run box api docs -p "Write docs"
+check "project, name, and prompt" args_are docs --remote-control docs --permission-mode auto -- "Write docs"
+check "...in the project" test "$(cat "$R/cwd-docs")" = "$R/rc/api"
+run box -d nosuch thing; check "a word that isn't a folder is part of the name" has "Started 'nosuch-thing'"
+                        check "...in the start folder" test "$(cat "$R/cwd-nosuch-thing")" = "$R/rc"
+run box -d .hidden x;   check "dot folders aren't projects" has "Started 'hidden-x'"
+# shellcheck disable=SC2088
+run box -d api other -C '~/my project'
+check "-C turns the project lookup off" has "Started 'api-other'"
+check "...and uses the -C folder" test "$(cat "$R/cwd-api-other")" = "$R/my project"
+run box2 -d web deploy; check "projects work in a DIR with a space" test "$(cat "$R/cwd-deploy")" = "$R/my project/web"
+
 # --- attaching without a terminal ---------------------------------------------------------
 run box attachme;       check "no terminal: starts in the background instead" has "Not attaching"
                         check "...and still starts it" alive attachme

@@ -18,6 +18,7 @@ app, or a terminal through its control URL.
 
 ```bash
 rc <computer> [name] -p "<task>"   # start in the background with a first prompt; prints the control URL
+rc <computer> <project> [name] -p "<task>"   # same, started in that project's folder (see below)
 rc <computer> -d <name>            # start in the background with no prompt
 rc <computer>                      # list sessions there, with control URLs
 rc <computer> -s <name>            # show the end of a session's screen: what Claude last said
@@ -29,8 +30,14 @@ rc doctor <computer>               # end-to-end check that explains how to fix p
 If `rc --version` doesn't print an rc version (rc was just installed, or another program is
 called `rc`), use `~/.local/bin/rc` instead.
 
-Sessions start in the computer's configured folder. Pass `-C <folder>` only to start somewhere
-else, such as a specific project. `-p -` reads the prompt from stdin, which is easiest for long
+Sessions start in the computer's configured folder (its `DIR`). If the first word after the
+computer names a folder inside `DIR` on that computer, the session starts in that folder instead
+and the remaining words are the session name: with `DIR='~/code'`,
+`rc devbox api fix tests -p "..."` starts session `fix-tests` in `~/code/api`.
+A project word alone names the session after the project, unless `-p` is given (then the name
+comes from the task). The project isn't part of the name, so stop or show it with
+`rc devbox -k fix-tests`. Pass `-C <folder>` for a folder that isn't directly inside `DIR`;
+`-C` turns the project lookup off. `-p -` reads the prompt from stdin, which is easiest for long
 prompts:
 
 ```bash

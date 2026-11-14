@@ -36,8 +36,15 @@ rc: start Claude Code Remote Control sessions on your other computers.
   rc ls                             list sessions on every computer you've used
   rc doctor <computer>              check a computer end to end and explain any fixes
 
+Projects: when the first word after <computer> is a folder inside the start folder, the
+session starts in that folder and the remaining words are its name. With DIR='~/code':
+  rc <computer> api fix tests       session 'fix-tests' in ~/code/api
+  rc <computer> api                 session 'api' in ~/code/api
+  rc <computer> api -p "<task>"     a session named from the task, in ~/code/api
+
 Options:
-  -C, --dir <folder>  folder to start in, on that computer (default: its DIR setting, else ~/rc)
+  -C, --dir <folder>  folder to start in, on that computer (default: its DIR setting, else ~/rc);
+                      turns off the project lookup, so every word is part of the name
   -a, --attach        attach after starting, even with -p
   -h, --help          show this help
   -V, --version       show the version and where rc is installed
@@ -180,6 +187,10 @@ show)
   ;;
 rmdir)
   rmdir "$(expand "$1")" 2>/dev/null
+  return 0
+  ;;
+isproj)
+  [ -d "$(expand "$1")/$2" ] && echo yes
   return 0
   ;;
 kill)
@@ -515,7 +526,7 @@ main() {
     doctor) [ $# -ge 2 ] || die "usage: rc doctor <computer>"; doctor "$2"; return ;;
   esac
   local computer=$1; shift
-  local mode="" attach_flag=0 have_prompt=0 prompt="" dir_opt="" words="" name trimmed auto=0 mk=0 attach=1
+  local mode="" attach_flag=0 have_prompt=0 prompt="" dir_opt="" words="" name trimmed first rest auto=0 mk=0 attach=1
   while [ $# -gt 0 ]; do
     case $1 in
       -d|--detach) mode="detach" ;;
@@ -539,35 +550,51 @@ main() {
   if [ -z "$DIR" ]; then DIR=$DEFAULT_DIR; mk=1; fi
 
   trimmed=${words# }
-  name=$(slug "$trimmed")
-  [ -z "$trimmed" ] || [ -n "$name" ] || die "session name '$trimmed' has no letters or numbers"
-  [ "$name" = "$trimmed" ] || say "note: using session name '$name'"
 
-  if [ "$mode" = kill ]; then
-    [ $have_prompt = 0 ] || die "-k and -p don't go together"
-    [ -n "$name" ] || die "which session? rc $C -k <name>"
-    net_up; kill_session "$name"; return
-  fi
-  if [ "$mode" = show ]; then
+  if [ "$mode" = kill ] || [ "$mode" = show ]; then
+    name=$(slug "$trimmed")
+    [ -z "$trimmed" ] || [ -n "$name" ] || die "session name '$trimmed' has no letters or numbers"
+    [ "$name" = "$trimmed" ] || say "note: using session name '$name'"
+    if [ "$mode" = kill ]; then
+      [ $have_prompt = 0 ] || die "-k and -p don't go together"
+      [ -n "$name" ] || die "which session? rc $C -k <name>"
+      net_up; kill_session "$name"; return
+    fi
     [ -n "$name" ] || die "which session? rc $C -s <name>"
     net_up; show_session "$name"; return
   fi
-  if [ -z "$name" ]; then
-    if [ $have_prompt = 1 ]; then
-      name=$(name_from_prompt "$prompt"); [ -n "$name" ] || name=task; auto=1
-    elif [ "$mode" = detach ]; then
-      die "which session? rc $C -d <name>"
-    else
-      net_up; remember; list_sessions; return
-    fi
+  if [ -z "$trimmed" ] && [ $have_prompt = 0 ]; then
+    [ "$mode" != detach ] || die "which session? rc $C -d <name>"
+    net_up; remember; list_sessions; return
   fi
+
+  net_up
+  # Projects: when the first word names a folder inside the start folder, start there instead,
+  # and the remaining words are the session name ("api fix tests" -> fix-tests in <DIR>/api).
+  # The project alone names the session after it, unless a prompt names it. -C turns this off.
+  first=${trimmed%% *} rest=""
+  [ "$first" = "$trimmed" ] || rest=${trimmed#* }
+  case $first in
+    ""|.*|*[!A-Za-z0-9._-]*) ;;
+    *)
+      if [ -z "$dir_opt" ] && [ "$(remote isproj "$DIR" "$first")" = yes ]; then
+        DIR=${DIR%/}/$first mk=0 trimmed=$rest
+        [ -n "$trimmed" ] || [ $have_prompt = 1 ] || trimmed=$first
+      fi ;;
+  esac
+  name=$(slug "$trimmed")
+  [ -z "$trimmed" ] || [ -n "$name" ] || die "session name '$trimmed' has no letters or numbers"
+  [ "$name" = "$trimmed" ] || say "note: using session name '$name'"
+  if [ -z "$name" ]; then
+    name=$(name_from_prompt "$prompt"); [ -n "$name" ] || name=task; auto=1
+  fi
+
   if [ "$mode" = detach ] || [ $have_prompt = 1 ]; then attach=0; fi
   [ $attach_flag = 0 ] || attach=1
   if [ $attach = 1 ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
     say "Not attaching: there's no terminal here. Starting '$name' in the background instead."
     attach=0
   fi
-  net_up
   remember
   start_session "$name" "$mk" "$auto" "$attach" "$have_prompt" "$prompt"
 }
