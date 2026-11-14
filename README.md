@@ -65,6 +65,7 @@ profile and open a new terminal (or run `~/.local/bin/rc` until you do). To upda
 | `rc devbox -d work` | Start it in the background and print its control URL |
 | `rc devbox -p "<task>"` | Start a session with a first prompt; it's named after the task |
 | `rc devbox work -p "<task>" -C '~/code/api'` | Same, with a name and a starting folder |
+| `rc devbox api fix tests` | Start session `fix-tests` in the project folder `api` inside `DIR` (see below) |
 | `rc devbox` | List sessions on devbox, with their control URLs |
 | `rc devbox -s work` | Show the end of `work`'s screen, to see what Claude last said |
 | `rc devbox -k work` | Stop session `work` |
@@ -74,6 +75,19 @@ profile and open a new terminal (or run `~/.local/bin/rc` until you do). To upda
 `-p -` reads the prompt from stdin. Inside an attached session, detach with `Ctrl-b d`; the
 session keeps running. When `claude` exits, the tmux session stays open so you can read what it
 printed; press Enter for a shell on that computer, or `Ctrl-D` to close the session.
+
+### Projects
+
+Point `DIR` at the folder that holds your repos, and name a project as the first word. If that
+word is a folder inside `DIR` on that computer, the session starts there and the remaining words
+are its name. With `DIR='~/code'`:
+
+- `rc devbox api fix tests` starts session `fix-tests` in `~/code/api`.
+- `rc devbox api` starts (or reattaches to) session `api` in `~/code/api`.
+- `rc devbox api -p "<task>"` starts a session named after the task in `~/code/api`.
+
+When the first word isn't a folder there, every word is part of the name, as before. The project
+isn't part of the session name, so `rc devbox -k fix-tests` stops it. `-C` turns the lookup off.
 
 ## Settings
 
