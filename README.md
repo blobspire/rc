@@ -19,6 +19,8 @@ claude.ai and in the Claude app, so you can check on it and steer it from anywhe
   `rc` brings that up first, and only when it's needed.
 - **Attach or don't.** `rc devbox work` drops you into the session. Add `-p "<task>"` to hand
   it a task and walk away.
+- **Name the project, not the path.** With your repos in one folder, `rc devbox api fix-tests`
+  starts session `fix-tests` in `~/code/api`.
 - **Agents can use it too.** The included Claude Code skill lets Claude start sessions on your
   other computers: "start an agent on devbox to profile the import job".
 - **Catches the usual snags.** It prints the control URL, and it tells you when a session is
@@ -86,8 +88,10 @@ are its name. With `DIR='~/code'`:
 - `rc devbox api` starts (or reattaches to) session `api` in `~/code/api`.
 - `rc devbox api -p "<task>"` starts a session named after the task in `~/code/api`.
 
-When the first word isn't a folder there, every word is part of the name, as before. The project
-isn't part of the session name, so `rc devbox -k fix-tests` stops it. `-C` turns the lookup off.
+When the first word isn't a folder there, every word is part of the name. The project isn't part
+of the session name, so `rc devbox -k fix-tests` stops it. `-C` turns the lookup off. Claude
+Code's answer to the trust question for `DIR` covers the projects inside it, so a new repo there
+works right away.
 
 ## Settings
 
@@ -97,7 +101,7 @@ commented out:
 
 ```bash
 SSH_HOST='devbox.example.com'      # what to pass to ssh, if different from the name you type
-DIR='~/code'                       # folder sessions start in (keep the quotes so ~ is that computer's home)
+DIR='~/code'                       # folder sessions start in; its subfolders are projects (quote ~)
 NET="$RC_HOME/examples/network/tailscale-up.sh"   # runs only when the computer can't be reached
 CLAUDE_ARGS='--permission-mode auto'               # flags for claude
 ```
@@ -105,8 +109,8 @@ CLAUDE_ARGS='--permission-mode auto'               # flags for claude
 The same keys in `~/.config/rc/config` apply to every computer. For one run, `RC_DIR` sets the
 folder and `RC_ARGS` adds flags, for example `RC_ARGS="--model opus --effort high" rc devbox work`.
 
-Without a `DIR`, sessions start in `~/rc` on that computer, which rc creates. Pick a real project
-folder if you have one. Claude Code asks once per folder whether you trust it, and never
+Without a `DIR`, sessions start in `~/rc` on that computer, which rc creates. Pick the folder
+that holds your projects if you have one. Claude Code asks once per folder whether you trust it, and never
 remembers that answer for your home folder, so rc doesn't start sessions there.
 
 ### Auto mode
@@ -155,9 +159,9 @@ control URL. It won't stop or type into sessions it didn't start unless you ask.
 Start with `rc doctor <computer>`. It checks SSH, tmux, Claude Code, the start folder, and
 settings that turn Remote Control off, then starts and stops a test session.
 
-- **"waiting for you to trust" the folder.** Run `rc <computer> <name>` in a terminal, choose
-  "Yes, I trust this folder", and detach with `Ctrl-b d`. Claude Code remembers the answer for
-  that folder.
+- **"waiting for you to trust" the folder.** Run the attach command rc printed in a terminal,
+  choose "Yes, I trust this folder", and detach with `Ctrl-b d`. Claude Code remembers the
+  answer for that folder and the folders inside it.
 - **"needs first-time setup".** Run `ssh -t <computer> claude` once in a terminal, pick a theme,
   and log in.
 - **"Remote Control isn't available".** rc shows the session's screen. Match the message to the

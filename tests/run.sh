@@ -47,6 +47,7 @@ run 'bad name';         check "invalid computer name is an error" has "doesn't l
 echo "$R/rc" > "$R/untrusted-dirs"
 run doctor box;         check "doctor reports the trust question" has "asking whether to trust"
                         check "...and exits 1" code 1
+                        check "...and its fix starts in the start folder, not a project" has "setup -C '~/rc'"
                         check "...and removes the folder it created" test ! -d "$R/rc"
 rm -f "$R/untrusted-dirs"
 
