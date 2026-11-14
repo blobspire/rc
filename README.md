@@ -1,5 +1,7 @@
 # rc
 
+[![test](https://github.com/blobspire/rc/actions/workflows/test.yml/badge.svg)](https://github.com/blobspire/rc/actions/workflows/test.yml)
+
 Start Claude Code sessions on your other computers with one command, then drive them from
 claude.ai, the Claude app on your phone, or your terminal.
 
