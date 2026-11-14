@@ -490,7 +490,7 @@ EOF
   case $warning in
     trust)
       bad "Claude Code is asking whether to trust $dir on $C (it asks once per folder)."
-      echo "        Fix: run 'rc $C setup' in a terminal, choose 'Yes, I trust this folder', then"
+      echo "        Fix: run \"rc $C setup -C '$dir'\" in a terminal, choose 'Yes, I trust this folder', then"
       echo "        detach with Ctrl-b d (the session keeps running) or keep working in it."
       if [ -n "$trusted" ]; then
         echo "        Or set DIR in $CFILE to a folder that's already trusted there:"

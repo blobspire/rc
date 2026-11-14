@@ -68,7 +68,9 @@ Do this before the first `rc doctor`. Claude Code asks once per folder whether t
 pick the folder first and answer that question once.
 
 Ask the user where sessions on that computer should start: usually the folder their projects
-live in. To see which folders Claude Code already trusts there:
+live in, such as `~/code`. Its subfolders become projects: `rc <computer> api fix-tests` starts
+session `fix-tests` in `~/code/api`, and trusting `~/code` once covers every project inside it.
+To see which folders Claude Code already trusts there:
 
 ```bash
 ssh <computer> "python3 -c \"import json,os; print('\n'.join(k for k,v in json.load(open(os.path.expanduser('~/.claude.json'))).get('projects',{}).items() if v.get('hasTrustDialogAccepted')))\""
@@ -109,11 +111,12 @@ a short test session; it appears briefly in the user's claude.ai session list.
   picks a theme, logs in with their claude.ai account (Pro, Max, Team, or Enterprise), then
   types `/exit`.
 - **Asking whether to trust the folder.** If the user would rather use a folder that's already
-  trusted, change `DIR` (step 3) and run doctor again. Otherwise the user runs
-  `~/.local/bin/rc <computer> setup` in a terminal, chooses "Yes, I trust this folder", and
-  types `/exit` (or keeps working in that session; `Ctrl-b d` detaches and leaves it running).
-  Claude Code remembers the answer for that folder. If they detached, stop the session when it's
-  no longer needed: `~/.local/bin/rc <computer> -k setup`.
+  trusted, change `DIR` (step 3) and run doctor again. Otherwise the user runs the command doctor
+  printed (`~/.local/bin/rc <computer> setup -C '<DIR>'`) in a terminal, chooses "Yes, I trust
+  this folder", and types `/exit` (or keeps working in that session; `Ctrl-b d` detaches and
+  leaves it running). Claude Code remembers the answer for that folder and the projects inside
+  it. If they detached, stop the session when it's no longer needed:
+  `~/.local/bin/rc <computer> -k setup`.
 - **Remote Control isn't available.** Show the user the screen doctor printed and match the
   message to https://code.claude.com/docs/en/remote-control#troubleshooting. Common causes: an
   API key login instead of claude.ai, a Team or Enterprise organization where an Owner hasn't
@@ -153,6 +156,8 @@ haven't opened a new terminal since fixing PATH:
 
 - `rc <computer> <name>` starts a session and attaches; `Ctrl-b d` detaches and leaves it running.
 - `rc <computer> -p "<task>"` starts a session with a task and prints its control URL.
+- `rc <computer> <project> <name>` starts in a project folder inside `DIR` (for example
+  `rc <computer> api fix-tests`).
 - `rc ls` lists sessions everywhere, and sessions appear at https://claude.ai/code and in the
   Claude app.
 - They can ask Claude Code to start agents on that computer; rc's skill handles it.
